@@ -40,6 +40,12 @@ SALES_PHONE = '18763712888'
 # For production, swap to Redis or a DB
 conversations = {}
 
+# Message deduplication — Interakt often sends the same webhook 2-3 times
+# Store recent message IDs to skip duplicates
+_processed_messages = set()
+_processed_messages_timestamps = {}  # msg_id -> timestamp for cleanup
+MAX_DEDUP_ENTRIES = 5000
+
 # ─── Temperature Detection Patterns ─────────────────────────────────────────
 
 WEBSITE_PATTERNS = [
@@ -1614,7 +1620,7 @@ def health():
     """Server health check."""
     return jsonify({
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "conversations_active": len(conversations),
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
@@ -1655,6 +1661,30 @@ def webhook_incoming():
     msg_data = data.get("data", {})
     customer = msg_data.get("customer", {})
     message_obj = msg_data.get("message", {})
+
+    # ─── Deduplication ────────────────────────────────────────────────────
+    # Interakt often sends the same webhook 2-3 times. Use message ID to skip dupes.
+    msg_id = message_obj.get("id", "")
+    if not msg_id:
+        # Fallback: create a dedup key from phone + message text + timestamp
+        _phone_dedup = customer.get("phone_number", "")
+        _text_dedup = message_obj.get("Initial Message", "") or message_obj.get("text", "")
+        msg_id = f"{_phone_dedup}:{_text_dedup[:100]}"
+
+    if msg_id in _processed_messages:
+        logger.info(f"DUPLICATE webhook skipped: msg_id={msg_id[:80]}")
+        return jsonify({"status": "ok", "note": "duplicate skipped"}), 200
+
+    _processed_messages.add(msg_id)
+    _processed_messages_timestamps[msg_id] = time.time()
+
+    # Cleanup old dedup entries (older than 30 min)
+    if len(_processed_messages) > MAX_DEDUP_ENTRIES:
+        cutoff = time.time() - 1800
+        stale = [k for k, v in _processed_messages_timestamps.items() if v < cutoff]
+        for k in stale:
+            _processed_messages.discard(k)
+            _processed_messages_timestamps.pop(k, None)
 
     # Extract phone — try customer.phone_number first (Interakt actual format)
     phone = customer.get("phone_number", "") or customer.get("channel_phone_number", "")
