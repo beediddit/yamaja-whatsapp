@@ -46,6 +46,9 @@ _processed_messages = set()
 _processed_messages_timestamps = {}  # msg_id -> timestamp for cleanup
 MAX_DEDUP_ENTRIES = 5000
 
+# Raw webhook log for debugging (last 50 payloads)
+_webhook_log = []
+
 # ─── Temperature Detection Patterns ─────────────────────────────────────────
 
 WEBSITE_PATTERNS = [
@@ -1620,9 +1623,19 @@ def health():
     """Server health check."""
     return jsonify({
         "status": "ok",
-        "version": "3.0.1",
+        "version": "3.0.2",
         "conversations_active": len(conversations),
+        "dedup_entries": len(_processed_messages),
         "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+
+@app.route('/debug/webhooks', methods=['GET'])
+def debug_webhooks():
+    """View raw webhook payloads for debugging (last 50)."""
+    return jsonify({
+        "total": len(_webhook_log),
+        "webhooks": _webhook_log
     })
 
 
@@ -1645,6 +1658,14 @@ def webhook_incoming():
 
     logger.info(f"Webhook received: {json.dumps(data, default=str)[:1000]}")
 
+    # Save raw payload for debugging
+    _webhook_log.append({
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "payload": data
+    })
+    if len(_webhook_log) > 50:
+        _webhook_log.pop(0)
+
     # ─── Parse Interakt payload ──────────────────────────────────────────
     # Interakt webhook structure (actual):
     # { "type": "message_received", "data": {
@@ -1662,25 +1683,40 @@ def webhook_incoming():
     customer = msg_data.get("customer", {})
     message_obj = msg_data.get("message", {})
 
-    # ─── Deduplication ────────────────────────────────────────────────────
-    # Interakt often sends the same webhook 2-3 times. Use message ID to skip dupes.
+    # ─── Deduplication (multi-layer) ────────────────────────────────────
+    # Layer 1: Exact message ID match
     msg_id = message_obj.get("id", "")
-    if not msg_id:
-        # Fallback: create a dedup key from phone + message text + timestamp
-        _phone_dedup = customer.get("phone_number", "")
-        _text_dedup = message_obj.get("Initial Message", "") or message_obj.get("text", "")
-        msg_id = f"{_phone_dedup}:{_text_dedup[:100]}"
+    # Layer 2: Phone + text content (catches dupes with different IDs)
+    _phone_dedup = customer.get("phone_number", "")
+    _text_dedup = (message_obj.get("Initial Message", "") or 
+                   message_obj.get("text", "") or "")[:100]
+    content_key = f"content:{_phone_dedup}:{_text_dedup}"
 
-    if msg_id in _processed_messages:
-        logger.info(f"DUPLICATE webhook skipped: msg_id={msg_id[:80]}")
-        return jsonify({"status": "ok", "note": "duplicate skipped"}), 200
+    # Check both layers
+    dedup_keys = []
+    if msg_id:
+        dedup_keys.append(f"id:{msg_id}")
+    if _phone_dedup and _text_dedup:
+        dedup_keys.append(content_key)
 
-    _processed_messages.add(msg_id)
-    _processed_messages_timestamps[msg_id] = time.time()
+    for key in dedup_keys:
+        if key in _processed_messages:
+            logger.info(f"DUPLICATE webhook skipped: key={key[:80]}")
+            return jsonify({"status": "ok", "note": "duplicate skipped"}), 200
+
+    # Mark all keys as processed
+    now = time.time()
+    for key in dedup_keys:
+        _processed_messages.add(key)
+        _processed_messages_timestamps[key] = now
+    # Also add a bare msg_id key for backwards compat
+    if msg_id:
+        _processed_messages.add(msg_id)
+        _processed_messages_timestamps[msg_id] = now
 
     # Cleanup old dedup entries (older than 30 min)
     if len(_processed_messages) > MAX_DEDUP_ENTRIES:
-        cutoff = time.time() - 1800
+        cutoff = now - 1800
         stale = [k for k, v in _processed_messages_timestamps.items() if v < cutoff]
         for k in stale:
             _processed_messages.discard(k)
