@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: yamaja-whatsapp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn yamaja_cold_intake:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: INTERAKT_API_KEY
+        sync: false
+      - key: MAKE_WEBHOOK_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.8"
+    plan: free
+    autoDeploy: true
