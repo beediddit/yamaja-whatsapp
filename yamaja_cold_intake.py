@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-yamaja_cold_intake.py — v4.0.0
+yamaja_cold_intake.py — v4.3.1
 Yamaja WhatsApp Chatbot Webhook Server (Render)
 
 Sits between customers (via Interakt/WhatsApp) and the Yamaja Engines sales team.
@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "4.0.0"
+VERSION = "4.3.2"
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -53,6 +53,9 @@ ADMIN_SECRET     = os.environ.get('ADMIN_SECRET', '')
 CLAUDIA_PHONE  = '18765642888'   # The chatbot number
 SALES_PHONE    = '18763712888'   # General sales line for lead forwarding
 MANAGER_PHONE  = '18769951632'   # Escalation target
+
+# Internal numbers — ignore incoming messages from these (one-way outbound only)
+INTERNAL_PHONES = {SALES_PHONE, MANAGER_PHONE, CLAUDIA_PHONE}
 
 # ─── SQLite Database ──────────────────────────────────────────────────────────
 
@@ -530,6 +533,7 @@ BRANCH_LINKS = {
 
 # States where free-text input should be buffered (3-second window)
 BUFFERED_STATES = {
+    "init", "awaiting_name_confirm",  # Buffer rapid-fire greetings into one initial message
     "branch_parts_b2a", "branch_parts_b2b", "branch_parts_b2c",
     "branch_engine_a2a", "branch_engine_a2b",
     "branch_boat_d2",
@@ -729,6 +733,7 @@ def new_conversation(phone: str, country_code: str = "+1") -> dict:
 
         # Tracking
         "all_messages": [],
+        "corrections": [],
         "message_count": 0,
         "state": "init",
         "created_at": now,
@@ -757,7 +762,11 @@ def get_or_create_conversation(phone: str) -> dict:
 # ─── Interakt API Helpers ─────────────────────────────────────────────────────
 
 def send_whatsapp_message(phone: str, message: str) -> bool:
-    """Send a plain text WhatsApp message via Interakt Send API."""
+    """Send a plain text WhatsApp message via Interakt Send API.
+
+    IMPORTANT: Interakt may return non-200 (e.g. 202) but still deliver the
+    message. We accept any 2xx as success and do NOT retry.
+    """
     if not INTERAKT_API_KEY:
         logger.warning("INTERAKT_API_KEY not set — skipping WhatsApp text send")
         return False
@@ -781,7 +790,10 @@ def send_whatsapp_message(phone: str, message: str) -> bool:
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
         logger.info(f"[WA TEXT] → {phone}: HTTP {resp.status_code} | {resp.text[:200]}")
-        return resp.status_code == 200
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.error(f"[WA TEXT] non-2xx ({resp.status_code}) for {phone}")
+        return False
     except Exception as e:
         logger.error(f"[WA TEXT] send failed for {phone}: {e}")
         return False
@@ -791,6 +803,9 @@ def send_whatsapp_buttons(phone: str, message: str, buttons: list[str]) -> bool:
     """
     Send a WhatsApp interactive button message via Interakt Send API.
     Maximum 3 buttons; each button title truncated to 20 characters.
+
+    IMPORTANT: Interakt uses type="InteractiveButton" with data.message wrapper,
+    NOT the standard WhatsApp type="Interactive" with data.interactive wrapper.
     """
     if not INTERAKT_API_KEY:
         logger.warning("INTERAKT_API_KEY not set — skipping button send")
@@ -813,13 +828,14 @@ def send_whatsapp_buttons(phone: str, message: str, buttons: list[str]) -> bool:
             }
         })
 
+    # Interakt-specific format: type="InteractiveButton", data.message (NOT data.interactive)
     payload = {
         "countryCode": country_code,
         "phoneNumber": clean_phone,
         "callbackData": "yamaja_chatbot",
-        "type": "Interactive",
+        "type": "InteractiveButton",
         "data": {
-            "interactive": {
+            "message": {
                 "type": "button",
                 "body": {"text": message},
                 "action": {"buttons": button_list}
@@ -830,7 +846,10 @@ def send_whatsapp_buttons(phone: str, message: str, buttons: list[str]) -> bool:
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
         logger.info(f"[WA BTN] → {phone}: HTTP {resp.status_code} | btns={buttons}")
-        return resp.status_code == 200
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.error(f"[WA BTN] non-2xx ({resp.status_code}) for {phone}")
+        return False
     except Exception as e:
         logger.error(f"[WA BTN] send failed for {phone}: {e}")
         return False
@@ -841,6 +860,9 @@ def send_whatsapp_list(phone: str, message: str, list_title: str,
     """
     Send a WhatsApp list message via Interakt Send API.
     Row titles truncated to 24 characters.
+
+    IMPORTANT: Interakt uses type="InteractiveList" with data.message wrapper,
+    NOT the standard WhatsApp type="Interactive" with data.interactive wrapper.
     """
     if not INTERAKT_API_KEY:
         logger.warning("INTERAKT_API_KEY not set — skipping list send")
@@ -858,13 +880,14 @@ def send_whatsapp_list(phone: str, message: str, list_title: str,
         for i, item in enumerate(items)
     ]
 
+    # Interakt-specific format: type="InteractiveList", data.message (NOT data.interactive)
     payload = {
         "countryCode": country_code,
         "phoneNumber": clean_phone,
         "callbackData": "yamaja_chatbot",
-        "type": "Interactive",
+        "type": "InteractiveList",
         "data": {
-            "interactive": {
+            "message": {
                 "type": "list",
                 "body": {"text": message},
                 "action": {
@@ -878,140 +901,305 @@ def send_whatsapp_list(phone: str, message: str, list_title: str,
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
         logger.info(f"[WA LIST] → {phone}: HTTP {resp.status_code} | items={items}")
-        return resp.status_code == 200
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.error(f"[WA LIST] non-2xx ({resp.status_code}) for {phone}")
+        return False
     except Exception as e:
         logger.error(f"[WA LIST] send failed for {phone}: {e}")
         return False
 
 
+# ─── Correction Handling ──────────────────────────────────────────────────────
+
+def _apply_correction(convo: dict, correction: str):
+    """
+    Apply a customer's correction to the conversation data.
+    Updates the primary detail field for the branch, and appends
+    to a corrections log so nothing is lost.
+    """
+    branch = convo.get("branch", "")
+
+    # Update the main detail field per branch so the lead template picks it up
+    if branch == "engine_sales":
+        convo["engine_model"] = correction[:200]
+    elif branch == "parts_sales":
+        convo["parts_description"] = correction[:500]
+    elif branch == "service":
+        convo["issue_description"] = correction[:500]
+    elif branch == "boat_sales":
+        convo["boat_model"] = correction[:200]
+    elif branch == "trailers":
+        convo["trailer_boat_info"] = correction[:200]
+    elif branch == "electronics":
+        convo["electronics_details"] = correction[:500]
+    elif branch == "atv_utv":
+        convo["atv_model"] = correction[:200]
+    elif branch == "fishing_gear":
+        convo["fishing_details"] = correction[:500]
+    elif branch == "general_accessories":
+        convo["accessories_details"] = correction[:500]
+    else:
+        convo["general_inquiry"] = correction[:500]
+
+    # Always append to corrections log (preserved for chat transcript)
+    corrections = convo.get("corrections", [])
+    corrections.append(correction[:500])
+    convo["corrections"] = corrections
+    logger.info(f"Correction applied for {convo.get('phone', '?')}: '{correction[:80]}'")
+
+
 # ─── Lead Forwarding ──────────────────────────────────────────────────────────
+
+def _get_lead_product(convo: dict) -> str:
+    """Extract the primary product/item from conversation data for template variable."""
+    branch = convo.get("branch", "")
+    if branch == "engine_sales":
+        return convo.get("engine_model") or convo.get("engine_family") or "Engine (TBD)"
+    elif branch == "parts_sales":
+        return convo.get("parts_list") or convo.get("parts_description") or "Parts"
+    elif branch == "service":
+        return convo.get("service_engine_model") or convo.get("service_type") or "Service"
+    elif branch == "boat_sales":
+        return convo.get("boat_model") or "Boat"
+    elif branch == "trailers":
+        return convo.get("trailer_boat_info") or "Trailer"
+    elif branch == "electronics":
+        return convo.get("electronics_brand") or "Marine Electronics"
+    elif branch == "atv_utv":
+        return convo.get("atv_model") or convo.get("atv_type") or "ATV/UTV"
+    elif branch == "fishing_gear":
+        return convo.get("fishing_brand") or "Fishing Gear"
+    elif branch == "general_accessories":
+        return convo.get("accessories_details", "")[:50] or "Accessories"
+    elif branch == "wave_runner_banned":
+        return "Wave Runner (Banned)"
+    return "General Inquiry"
+
+
+# _get_lead_condition removed in v4.2.0 — condition info now merged into _get_lead_details
+
+
+def _get_lead_details(convo: dict) -> str:
+    """Build branch-specific details string for template variable (max ~200 chars).
+    Now includes condition info merged in (replaces the old standalone condition var).
+    """
+    branch = convo.get("branch", "")
+    parts = []
+
+    if branch == "engine_sales":
+        if convo.get("condition_preference"): parts.append(f"Cond: {convo['condition_preference']}")
+        if convo.get("use_case"):          parts.append(f"Use: {convo['use_case']}")
+        if convo.get("boat_size"):         parts.append(f"Boat: {convo['boat_size']}")
+        if convo.get("accessories_needed"): parts.append(f"Acc: {convo['accessories_needed']}")
+        if convo.get("current_engine"):    parts.append(f"Curr: {convo['current_engine']}")
+        if convo.get("serial_number"):     parts.append(f"Serial: {convo['serial_number']}")
+
+    elif branch == "parts_sales":
+        if convo.get("unit_info"):          parts.append(f"Engine: {convo['unit_info']}")
+        if convo.get("sub_branch"):         parts.append(f"Type: {convo['sub_branch']}")
+        if convo.get("parts_description"):  parts.append(convo['parts_description'][:80])
+
+    elif branch == "service":
+        if convo.get("service_type"):       parts.append(f"Svc: {convo['service_type']}")
+        if convo.get("service_serial"):     parts.append(f"Serial: {convo['service_serial']}")
+        if convo.get("issue_description"):  parts.append(convo['issue_description'][:80])
+        if convo.get("desired_engine"):     parts.append(f"Want: {convo['desired_engine']}")
+        if convo.get("service_location"):   parts.append(f"Loc: {convo['service_location']}")
+        if convo.get("urgency"):            parts.append(f"Urgency: {convo['urgency']}")
+
+    elif branch == "boat_sales":
+        if convo.get("boat_condition"):     parts.append(f"Cond: {convo['boat_condition']}")
+        if convo.get("boat_use"):           parts.append(f"Use: {convo['boat_use']}")
+
+    elif branch == "trailers":
+        if convo.get("trailer_boat_info"):  parts.append(convo['trailer_boat_info'][:80])
+
+    elif branch == "electronics":
+        if convo.get("electronics_details"): parts.append(convo['electronics_details'][:80])
+
+    elif branch == "atv_utv":
+        if convo.get("condition_preference"): parts.append(f"Cond: {convo['condition_preference']}")
+        if convo.get("atv_use_case"):       parts.append(f"Use: {convo['atv_use_case']}")
+        if convo.get("atv_type"):           parts.append(f"Type: {convo['atv_type']}")
+
+    elif branch == "fishing_gear":
+        if convo.get("fishing_details"):    parts.append(convo['fishing_details'][:80])
+
+    elif branch == "general_accessories":
+        if convo.get("accessories_details"): parts.append(convo['accessories_details'][:80])
+
+    elif branch in ("general_inquiry", "wave_runner_banned"):
+        if convo.get("general_inquiry"):    parts.append(convo['general_inquiry'][:80])
+
+    if convo.get("website_message"):
+        parts.append(f"Web: {convo['website_message'][:60]}")
+
+    return "; ".join(parts)[:200] if parts else "None"
+
+
+def _get_lead_source(convo: dict) -> str:
+    """Build a human-readable source string for the lead."""
+    temp = convo.get("temperature", "cold")
+    source_page = convo.get("source_page", "direct")
+    branch = convo.get("branch", "")
+    branch_display = BRANCH_DISPLAY.get(branch, branch.replace("_", " ").title())
+
+    if temp == "hot" and source_page == "contact-form":
+        return "Website contact form"
+    elif temp == "warm" and convo.get("website_referral"):
+        page = source_page.replace("-", " ").title() if source_page else "Unknown"
+        return f"Website ({page})"
+    elif temp == "cold":
+        return "Cold WhatsApp"
+    return f"WhatsApp ({temp})"
+
+
+def _build_chat_pages(convo: dict, max_chars: int = 500) -> list[str]:
+    """
+    Build paginated chat log strings from all_messages.
+    Each page is at most max_chars so it fits in a template variable or text.
+    Returns a list of page strings.
+    """
+    messages = convo.get("all_messages", [])
+    corrections = convo.get("corrections", [])
+    if not messages:
+        return ["(no messages)"]
+
+    # Build numbered lines
+    lines = []
+    for i, msg in enumerate(messages, 1):
+        # Truncate each individual message to avoid one giant message blowing the page
+        truncated = msg[:150] + "..." if len(msg) > 150 else msg
+        lines.append(f"{i}. {truncated}")
+
+    # Add corrections if any
+    if corrections:
+        lines.append("")
+        lines.append("Edits:")
+        for c in corrections:
+            lines.append(f"- {c[:150]}")
+
+    # Paginate
+    pages = []
+    current_page = ""
+    for line in lines:
+        candidate = (current_page + "\n" + line).strip() if current_page else line
+        if len(candidate) <= max_chars:
+            current_page = candidate
+        else:
+            if current_page:
+                pages.append(current_page)
+            current_page = line[:max_chars]  # Start new page (truncate if single line > max)
+    if current_page:
+        pages.append(current_page)
+
+    # Cap at 5 pages max
+    if len(pages) > 5:
+        pages = pages[:5]
+        pages[-1] = pages[-1][:max_chars - 30] + "\n... (truncated, check /leads)"
+
+    return pages or ["(no messages)"]
+
+
+def _send_template(template_name: str, body_values: list[str],
+                   callback: str = "yamaja_lead_forward") -> bool:
+    """Send a template message to SALES_PHONE. Returns True on 2xx."""
+    country_code, clean_phone = _format_phone_for_interakt(SALES_PHONE)
+    url = "https://api.interakt.ai/v1/public/message/"
+    headers = {
+        "Authorization": f"Basic {INTERAKT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "countryCode": country_code,
+        "phoneNumber": clean_phone,
+        "callbackData": callback,
+        "type": "Template",
+        "template": {
+            "name": template_name,
+            "languageCode": "en",
+            "bodyValues": body_values
+        }
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        logger.info(f"[WA TPL] {template_name} -> {SALES_PHONE}: "
+                    f"HTTP {resp.status_code} | {resp.text[:300]}")
+        return 200 <= resp.status_code < 300
+    except Exception as e:
+        logger.error(f"[WA TPL] {template_name} send failed: {e}")
+        return False
+
 
 def forward_lead_to_whatsapp(convo: dict) -> bool:
     """
-    Forward a confirmed lead to SALES_PHONE as a formatted WhatsApp text message
-    via the Interakt Send API.
+    Forward a confirmed lead to SALES_PHONE as plain text (two messages):
 
-    Replaces forward_to_make() as the primary lead forwarding method.
+    1) Lead card — structured summary of the inquiry.
+    2) Chat log — full conversation transcript, paginated.
     """
+    if not INTERAKT_API_KEY:
+        logger.warning("INTERAKT_API_KEY not set — skipping lead forward")
+        return False
+
     phone        = convo.get("phone", "")
-    name         = convo.get("customer_name", "Unknown")
+    name         = convo.get("customer_name", "") or "Unknown"
     branch       = convo.get("branch", "")
-    temperature  = convo.get("temperature", "cold")
-    fisherman_id = convo.get("fisherman_id", "") or "N/A"
-    first_msg    = convo.get("first_message", "")
-    timestamp    = convo.get("last_message_at", datetime.now(timezone.utc).isoformat())
+    fisherman_id = convo.get("fisherman_id", "") or "None"
+    first_msg    = (convo.get("first_message", "") or "")[:150] or "(none)"
+    msg_count    = str(convo.get("message_count", 0)) + " msgs"
+    timestamp    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     branch_display = BRANCH_DISPLAY.get(branch, branch.replace("_", " ").title())
-
-    # Build branch-specific details block
-    details_lines = []
-
-    if branch == "engine_sales":
-        if convo.get("engine_model"):
-            details_lines.append(f"Model: {convo['engine_model']}")
-        if convo.get("engine_family"):
-            details_lines.append(f"Family: {convo['engine_family']}")
-        if convo.get("condition_preference"):
-            details_lines.append(f"Condition: {convo['condition_preference']}")
-        if convo.get("use_case"):
-            details_lines.append(f"Use: {convo['use_case']}")
-        if convo.get("boat_size"):
-            details_lines.append(f"Boat Size: {convo['boat_size']}")
-        if convo.get("accessories_needed"):
-            details_lines.append(f"Accessories: {convo['accessories_needed']}")
-        if convo.get("current_engine"):
-            details_lines.append(f"Current Engine: {convo['current_engine']}")
-        if convo.get("serial_number"):
-            details_lines.append(f"Serial: {convo['serial_number']}")
-
-    elif branch == "parts_sales":
-        if convo.get("unit_info"):
-            details_lines.append(f"Engine Info: {convo['unit_info']}")
-        if convo.get("parts_list"):
-            details_lines.append(f"Part Numbers: {convo['parts_list']}")
-        if convo.get("parts_description"):
-            details_lines.append(f"Description: {convo['parts_description']}")
-        if convo.get("sub_branch"):
-            details_lines.append(f"Request Type: {convo['sub_branch']}")
-
-    elif branch == "service":
-        if convo.get("service_type"):
-            details_lines.append(f"Service Type: {convo['service_type']}")
-        if convo.get("service_engine_model"):
-            details_lines.append(f"Engine: {convo['service_engine_model']}")
-        if convo.get("service_serial"):
-            details_lines.append(f"Serial: {convo['service_serial']}")
-        if convo.get("issue_description"):
-            details_lines.append(f"Issue: {convo['issue_description']}")
-        if convo.get("desired_engine"):
-            details_lines.append(f"Desired Engine: {convo['desired_engine']}")
-        if convo.get("service_location"):
-            details_lines.append(f"Location: {convo['service_location']}")
-        if convo.get("urgency"):
-            details_lines.append(f"Urgency: {convo['urgency']}")
-
-    elif branch == "boat_sales":
-        if convo.get("boat_model"):
-            details_lines.append(f"Model: {convo['boat_model']}")
-        if convo.get("boat_condition"):
-            details_lines.append(f"Condition Pref: {convo['boat_condition']}")
-        if convo.get("boat_use"):
-            details_lines.append(f"Use: {convo['boat_use']}")
-
-    elif branch == "trailers":
-        if convo.get("trailer_boat_info"):
-            details_lines.append(f"Boat Info: {convo['trailer_boat_info']}")
-
-    elif branch == "electronics":
-        if convo.get("electronics_brand"):
-            details_lines.append(f"Brand: {convo['electronics_brand']}")
-        if convo.get("electronics_details"):
-            details_lines.append(f"Details: {convo['electronics_details']}")
-
-    elif branch == "atv_utv":
-        if convo.get("atv_type"):
-            details_lines.append(f"Type: {convo['atv_type']}")
-        if convo.get("atv_use_case"):
-            details_lines.append(f"Use: {convo['atv_use_case']}")
-        if convo.get("atv_model"):
-            details_lines.append(f"Model: {convo['atv_model']}")
-        if convo.get("condition_preference"):
-            details_lines.append(f"Condition: {convo['condition_preference']}")
-
-    elif branch == "fishing_gear":
-        if convo.get("fishing_brand"):
-            details_lines.append(f"Brand/Category: {convo['fishing_brand']}")
-        if convo.get("fishing_details"):
-            details_lines.append(f"Details: {convo['fishing_details']}")
-
-    elif branch == "general_accessories":
-        if convo.get("accessories_details"):
-            details_lines.append(f"Details: {convo['accessories_details']}")
-
-    elif branch in ("general_inquiry", "wave_runner_banned"):
-        if convo.get("general_inquiry"):
-            details_lines.append(f"Request: {convo['general_inquiry']}")
-
-    if convo.get("website_message"):
-        details_lines.append(f"Website Message: {convo['website_message'][:200]}")
-
-    details_block = "\n".join(details_lines) if details_lines else "No additional details"
-
-    message = (
-        "📨 NEW LEAD FROM CLAUDIA\n\n"
-        f"👤 Name: {name}\n"
-        f"📞 Phone: {phone}\n"
-        f"🎯 Category: {branch_display}\n"
-        f"🌡️ Temperature: {temperature}\n"
-        f"🔹 Fisherman ID: {fisherman_id}\n\n"
-        f"💬 First Message: {first_msg}\n\n"
-        f"📋 Details:\n{details_block}\n\n"
-        f"📱 Reply to customer: wa.me/{phone}\n"
-        f"⏰ Received: {timestamp}"
-    )
+    product   = _get_lead_product(convo)[:100]
+    details   = _get_lead_details(convo)
+    source    = _get_lead_source(convo)[:50]
+    reply_link = f"wa.me/{phone}"
 
     logger.info(f"Forwarding lead for {phone} to SALES_PHONE {SALES_PHONE}")
-    return send_whatsapp_message(SALES_PHONE, message)
+
+    # ── Part 1: Lead Card (plain text) ────────────────────────────────────────
+    lead_msg = (
+        "\U0001f4e8 *NEW LEAD FROM CLAUDIA*\n\n"
+        f"\U0001f4ac *First Msg:* {first_msg}\n"
+        f"\U0001f464 *Name:* {name}\n"
+        f"\U0001f4de *Phone:* {phone}\n"
+        f"\U0001f3af *Category:* {branch_display}\n"
+        f"\U0001f4ca *Engagement:* {msg_count}\n"
+        f"\U0001f3a3 *Fisherman ID:* {fisherman_id}\n"
+        f"\U0001f4cc *Product:* {product}\n"
+        f"\U0001f517 *Source:* {source}\n"
+        f"\U0001f4dd *Details:* {details}\n"
+        f"\U0001f4f1 *Reply:* {reply_link}"
+    )
+    send_whatsapp_message(SALES_PHONE, lead_msg)
+
+    # ── Part 2: Chat Log (paginated, plain text) ─────────────────────────────
+    # Note: _build_chat_pages already includes edits at the end, so we don't
+    # duplicate them here.
+    chat_pages = _build_chat_pages(convo, max_chars=500)
+    total_pages = len(chat_pages)
+
+    for i, page_text in enumerate(chat_pages):
+        header = f"\U0001f4cb *CHAT LOG* \u2014 {name}"
+        if total_pages > 1:
+            header += f" ({i+1}/{total_pages})"
+        plain_msg = (
+            f"{header}\n"
+            f"\U0001f4de {phone}\n\n"
+            f"\U0001f5e3\ufe0f Customer said:\n{page_text}"
+        )
+        if i == 0:
+            plain_msg += f"\n\n\u23f0 {timestamp}"
+        send_whatsapp_message(SALES_PHONE, plain_msg)
+
+        # Small delay between pages to preserve order
+        if i < total_pages - 1:
+            time.sleep(1)
+
+    logger.info(f"Lead forwarded for {phone}: {total_pages} chat pages")
+    return True
 
 
 # ─── Make.com Forwarding (DISABLED — kept for future use) ────────────────────
@@ -1129,120 +1317,194 @@ def escalate_to_manager(convo: dict) -> bool:
 # ─── Summary Builder ──────────────────────────────────────────────────────────
 
 def build_summary(convo: dict) -> str:
-    """Build a human-readable summary of the conversation data for confirmation."""
+    """Build a conversational summary that parrots back the customer's own words.
+
+    Instead of robotic field labels (🔹 Condition: X) we reflect what the
+    customer actually said, so the confirmation reads like an attentive
+    listener repeating it back.
+    """
     branch = convo.get("branch", "")
+    name   = convo.get("customer_name", "") or "there"
+    fid    = convo.get("fisherman_id", "")
     lines  = []
 
     if branch == "engine_sales":
-        lines.append("Here's your engine inquiry:")
+        model = convo.get("engine_model", "")
+        cond  = convo.get("condition_preference", "")
+        use   = convo.get("use_case", "")
+        bsize = convo.get("boat_size", "")
+        accs  = convo.get("accessories_needed", "")
+
+        lines.append(f"Ok {name}, just to make sure I have this right —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Model: {convo['engine_model'] or 'Help me choose'}")
-        lines.append(f"🔹 Condition: {convo['condition_preference'] or 'Not specified'}")
-        if convo.get("use_case"):
-            lines.append(f"🔹 Use: {convo['use_case']}")
-        if convo.get("boat_size"):
-            lines.append(f"🔹 Boat Size: {convo['boat_size']}")
-        if convo.get("accessories_needed"):
-            lines.append(f"🔹 Accessories: {convo['accessories_needed']}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        if model:
+            lines.append(f"You're looking for a {model}.")
+        else:
+            lines.append("You'd like help choosing the right engine.")
+        if use:
+            lines.append(f"It's for {use}.")
+        if bsize:
+            lines.append(f"Boat size: {bsize}.")
+        if cond:
+            lines.append(f"Condition: {cond}.")
+        if accs:
+            lines.append(f"Accessories: {accs}.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "parts_sales":
-        lines.append("Here's your parts inquiry:")
+        unit  = convo.get("unit_info", "")
+        plist = convo.get("parts_list", "")
+        pdesc = convo.get("parts_description", "")
+
+        lines.append(f"Ok {name}, here's what I got —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Request Type: {convo.get('sub_branch', 'Other')}")
-        if convo.get("unit_info"):
-            lines.append(f"🔹 Engine Info: {convo['unit_info']}")
-        if convo.get("parts_list"):
-            lines.append(f"🔹 Part Numbers: {convo['parts_list']}")
-        if convo.get("parts_description"):
-            lines.append(f"🔹 Description: {convo['parts_description']}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You need parts for your Yamaha.")
+        if unit:
+            lines.append(f"Engine info: {unit}.")
+        if plist:
+            lines.append(f"Part numbers: {plist}.")
+        if pdesc:
+            lines.append(f"You said: \"{pdesc}\"")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "service":
-        lines.append("Your service request:")
+        stype  = convo.get("service_type", "")
+        engine = convo.get("service_engine_model", "")
+        serial = convo.get("service_serial", "")
+        issue  = convo.get("issue_description", "")
+        desired = convo.get("desired_engine", "")
+        loc    = convo.get("service_location", "")
+        urg    = convo.get("urgency", "")
+
+        lines.append(f"Ok {name}, let me read this back —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Service Type: {convo.get('service_type', 'Not specified')}")
-        if convo.get("service_engine_model"):
-            lines.append(f"🔹 Engine: {convo['service_engine_model']}")
-        if convo.get("service_serial"):
-            lines.append(f"🔹 Serial: {convo['service_serial']}")
-        if convo.get("issue_description"):
-            lines.append(f"🔹 Issue: {convo['issue_description']}")
-        if convo.get("desired_engine"):
-            lines.append(f"🔹 Desired Engine: {convo['desired_engine']}")
-        if convo.get("service_location"):
-            lines.append(f"🔹 Location: {convo['service_location']}")
-        if convo.get("urgency"):
-            lines.append(f"🔹 Urgency: {convo['urgency']}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        if stype:
+            lines.append(f"You need: {stype}.")
+        if engine:
+            lines.append(f"Engine: {engine}.")
+        if serial:
+            lines.append(f"Serial: {serial}.")
+        if issue:
+            lines.append(f"You mentioned: \"{issue}\"")
+        if desired:
+            lines.append(f"You're looking at a {desired}.")
+        if loc:
+            lines.append(f"Location: {loc}.")
+        if urg:
+            lines.append(f"Urgency: {urg}.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "boat_sales":
-        lines.append("Your boat inquiry:")
+        model = convo.get("boat_model", "")
+        cond  = convo.get("boat_condition", "")
+        use   = convo.get("boat_use", "")
+
+        lines.append(f"Ok {name}, just confirming —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        if convo.get("boat_model"):
-            lines.append(f"🔹 Model: {convo['boat_model']}")
-        lines.append(f"🔹 Condition Pref: {convo.get('boat_condition', 'Not specified')}")
-        lines.append(f"🔹 Usage: {convo.get('boat_use', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You're interested in a boat.")
+        if model:
+            lines.append(f"Specifically a {model}.")
+        if cond:
+            lines.append(f"You said {cond}.")
+        if use:
+            lines.append(f"For {use}.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "trailers":
-        lines.append("Your trailer inquiry:")
+        info = convo.get("trailer_boat_info", "")
+
+        lines.append(f"Ok {name}, here's what I have —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Boat Info: {convo.get('trailer_boat_info', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You need a trailer.")
+        if info:
+            lines.append(f"For: {info}.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "electronics":
-        lines.append("Your electronics inquiry:")
+        brand   = convo.get("electronics_brand", "")
+        details = convo.get("electronics_details", "")
+
+        lines.append(f"Ok {name}, just making sure —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Brand: {convo.get('electronics_brand', 'Not specified')}")
-        lines.append(f"🔹 Details: {convo.get('electronics_details', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You're looking at marine electronics.")
+        if brand:
+            lines.append(f"Brand: {brand}.")
+        if details:
+            lines.append(f"You said: \"{details}\"")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "atv_utv":
-        lines.append("Your ATV/UTV inquiry:")
+        atype = convo.get("atv_type", "")
+        ause  = convo.get("atv_use_case", "")
+        model = convo.get("atv_model", "")
+        cond  = convo.get("condition_preference", "")
+
+        lines.append(f"Ok {name}, let me confirm —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Type: {convo.get('atv_type', 'Not specified')}")
-        lines.append(f"🔹 Use: {convo.get('atv_use_case', 'Not specified')}")
-        if convo.get("atv_model"):
-            lines.append(f"🔹 Model: {convo['atv_model']}")
-        lines.append(f"🔹 Condition: {convo.get('condition_preference', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        if atype:
+            lines.append(f"You're looking for a {atype}.")
+        else:
+            lines.append("You're interested in an ATV/UTV.")
+        if model:
+            lines.append(f"Model: {model}.")
+        if ause:
+            lines.append(f"For {ause}.")
+        if cond:
+            lines.append(f"Condition: {cond}.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "fishing_gear":
-        lines.append("Your fishing gear inquiry:")
+        brand   = convo.get("fishing_brand", "")
+        details = convo.get("fishing_details", "")
+
+        lines.append(f"Ok {name}, here's what I got —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Category: {convo.get('fishing_brand', 'Not specified')}")
-        lines.append(f"🔹 Details: {convo.get('fishing_details', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You're looking at fishing gear.")
+        if brand:
+            lines.append(f"Category: {brand}.")
+        if details:
+            lines.append(f"You said: \"{details}\"")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "general_accessories":
-        lines.append("Your accessories inquiry:")
+        details = convo.get("accessories_details", "")
+
+        lines.append(f"Ok {name}, just to confirm —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Details: {convo.get('accessories_details', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        lines.append("You need accessories.")
+        if details:
+            lines.append(f"You said: \"{details}\"")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     elif branch == "general_inquiry":
-        lines.append("Here's what I have:")
+        inquiry = convo.get("general_inquiry", "")
+
+        lines.append(f"Ok {name}, here's what I have —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        lines.append(f"🔹 Request: {convo.get('general_inquiry', 'Not specified')}")
-        lines.append(f"🔹 Fisherman ID: {convo['fisherman_id'] or 'N/A'}")
+        if inquiry:
+            lines.append(f"You said: \"{inquiry}\"")
+        else:
+            lines.append("You had a general question for the team.")
+        if fid:
+            lines.append(f"Fisherman ID: {fid}.")
 
     else:
-        lines.append("Your inquiry:")
+        lines.append(f"Ok {name}, just confirming —")
         lines.append("")
-        lines.append(f"🔹 Name: {convo['customer_name']}")
-        if convo.get("general_inquiry"):
-            lines.append(f"🔹 Details: {convo['general_inquiry']}")
+        inquiry = convo.get("general_inquiry", "")
+        if inquiry:
+            lines.append(f"You said: \"{inquiry}\"")
+        else:
+            lines.append("I'll pass your details to the team.")
 
     return "\n".join(lines)
 
@@ -1367,6 +1629,7 @@ def handle_returning_customer(convo: dict, message_text: str) -> bool:
                 f"Thanks for reaching out to Yamaja Engines, {name}! "
                 "Have a great day. 🙌"
             )
+            convo["state"] = "completed"  # Prevent goodbye loop
             save_conversation(convo)
             return True
 
@@ -1440,13 +1703,19 @@ def handle_returning_customer(convo: dict, message_text: str) -> bool:
 
 def _start_new_inquiry(convo: dict):
     """Reset conversation for a new inquiry, preserving name and fisherman ID."""
-    phone     = convo["phone"]
-    name      = convo.get("customer_name", "")
-    fid       = convo.get("fisherman_id", "")
-    temp      = convo.get("temperature", "cold")
+    phone       = convo["phone"]
+    name        = convo.get("customer_name", "")
+    traits_name = convo.get("_traits_name", "")
+    fid         = convo.get("fisherman_id", "")
+    temp        = convo.get("temperature", "cold")
+
+    # If customer_name was never set but we have traits, use traits
+    if not name and traits_name:
+        name = traits_name
 
     fresh = new_conversation(phone)
     fresh["customer_name"] = name
+    fresh["_traits_name"]  = traits_name
     fresh["fisherman_id"]  = fid
     fresh["temperature"]   = temp
     fresh["state"]         = "awaiting_menu_1"
@@ -1454,12 +1723,8 @@ def _start_new_inquiry(convo: dict):
     convo.clear()
     convo.update(fresh)
 
-    send_whatsapp_list(
-        phone,
-        f"Of course, {name}! What are you looking for today?",
-        "Choose One",
-        ["Engines", "Parts", "Service", "Something Else"]
-    )
+    greeting = f"Of course, {name}! What are you looking for today?" if name else "What are you looking for today?"
+    _show_menu_1(convo, greeting=greeting)
     save_conversation(convo)
 
 
@@ -1638,8 +1903,44 @@ def process_cold_message(convo: dict, message_text: str):
     phone     = convo["phone"]
     text_lower = message_text.strip().lower()
 
+    # ── "Website" keyword trigger (mid-flow, any state except early / paused) ─
+    _WEBSITE_SKIP_STATES = {
+        "init", "awaiting_name", "awaiting_name_verify", "awaiting_name_confirm",
+        "awaiting_website_return", "completed", "post_complete",
+    }
+    _WEBSITE_KEYWORDS = {"website", "site", "browse", "online"}
+    if state not in _WEBSITE_SKIP_STATES and _WEBSITE_KEYWORDS & set(text_lower.split()):
+        convo["_pre_website_state"] = state  # remember where we were
+        convo["state"] = "awaiting_website_return"
+        send_whatsapp_message(
+            phone,
+            "Sure! You can browse our full catalogue here:\n\n"
+            "\U0001f310 *yamja.com*\n\n"
+            "Take your time — when you're ready, just send me a message "
+            "and we'll pick up right where we left off."
+        )
+        save_conversation(convo)
+        return
+
+    # ── awaiting_website_return: Customer comes back after browsing ────────────
+    if state == "awaiting_website_return":
+        prev_state = convo.get("_pre_website_state", "awaiting_menu_1")
+        convo["state"] = prev_state
+        logger.info(f"Website return for {phone}: resuming state '{prev_state}'")
+        # If they come back with useful text, detect intent or fall through
+        # to normal state handling below with restored state.
+        state = prev_state  # update local var so the rest of the function routes correctly
+        # Re-derive text_lower in case we need it
+        # (already set above, no change needed)
+
     # ── init: Welcome, check traits.name or ask for name ──────────────────────
     if state == "init":
+        # If this came from a buffered flush, the combined text is the real
+        # "first message".  Overwrite so lead cards / summaries use it.
+        if len(convo.get("all_messages", [])) > 1:
+            convo["first_message"] = message_text[:1000]
+            logger.info(f"Buffered init — first_message updated to: '{message_text[:100]}'")
+
         # Check if Interakt has a name in traits (set during create_conversation)
         traits_name = convo.get("_traits_name", "")
         if traits_name:
@@ -1669,8 +1970,13 @@ def process_cold_message(convo: dict, message_text: str):
             convo["state"] = "awaiting_name"
             send_whatsapp_message(phone, "No problem! What would you like me to call you?")
         else:
-            # Accept the proposed name (or typed confirmation)
-            convo["customer_name"] = proposed
+            # B2 fix: If they typed something different from the proposed name,
+            # treat the typed text as their preferred name
+            typed = message_text.strip()
+            if typed.lower() != proposed.lower() and len(typed) >= 2:
+                convo["customer_name"] = typed
+            else:
+                convo["customer_name"] = proposed
             _proceed_after_name(convo)
         return
 
@@ -1703,28 +2009,25 @@ def process_cold_message(convo: dict, message_text: str):
 
     # ── awaiting_fisherman_id: Ask if they have a fisherman ID ────────────────
     elif state == "awaiting_fisherman_id":
-        # Normalise typed yes/no to button values
-        if text_lower in ("yes", "yeah", "yep", "yup", "ye", "y", "i have one",
-                          "yes i have one", "yes, i have one"):
-            convo["state"] = "awaiting_fisherman_id_value"
-            send_whatsapp_message(phone, "Please type your Fisherman ID number:")
-        elif text_lower in ("no", "nah", "nope", "none", "don't have", "i don't have",
-                            "i don't have one", "no fisherman id", "no id"):
-            convo["fisherman_id"] = ""
-            _proceed_after_fisherman_id(convo)
-        elif any(c.isdigit() for c in text_lower):
-            # Looks like they typed an ID number directly
+        # Check for digits first — they might be giving an ID directly
+        if any(c.isdigit() for c in text_lower):
             convo["fisherman_id"] = message_text.strip()
             logger.info(f"Fisherman ID accepted directly: {convo['fisherman_id']}")
             _proceed_after_fisherman_id(convo)
+        # Fuzzy "no" matching — any message containing a negative word
+        elif any(neg in text_lower for neg in ("no", "nah", "nope", "none", "don't", "dont", "n/a")):
+            convo["fisherman_id"] = ""
+            _proceed_after_fisherman_id(convo)
+        # Yes variants
+        elif text_lower in ("yes", "yeah", "yep", "yup", "ye", "y", "i have one",
+                            "yes i have one", "yes, i have one", "sure", "i do"):
+            convo["state"] = "awaiting_fisherman_id_value"
+            send_whatsapp_message(phone, "Please type your Fisherman ID number:")
         else:
-            # Re-show the button prompt
-            send_whatsapp_buttons(
-                phone,
-                "Do you have a Fisherman ID? (It helps us apply tax incentives for "
-                "registered fishermen.)",
-                ["Yes, I Have One", "No"]
-            )
+            # Accept anything else as the ID (don't loop — v3.7.3 behavior)
+            convo["fisherman_id"] = message_text.strip()
+            logger.info(f"Fisherman ID accepted (fallback): {convo['fisherman_id']}")
+            _proceed_after_fisherman_id(convo)
         return
 
     # ── awaiting_fisherman_id_value: User is typing their ID ─────────────────
@@ -1734,52 +2037,43 @@ def process_cold_message(convo: dict, message_text: str):
         _proceed_after_fisherman_id(convo)
         return
 
-    # ── awaiting_menu_1: Engines / Parts / Service / Something Else ───────────
+    # ── awaiting_menu_1: Full 10-item category list ───────────────────────────────
     elif state == "awaiting_menu_1":
-        if "engine" in text_lower:
+        # R3: Run intent detection first for typed responses (handles
+        # ambiguous inputs like "parts for my engine" → parts, not engines)
+        intent = detect_intent(message_text)
+        if intent:
+            if intent == "engine_sales":    _go_engine_sales(convo)
+            elif intent == "parts_sales":   _go_parts_sales(convo)
+            elif intent == "service":       _go_service(convo)
+            elif intent == "boat_sales":    _go_boat_sales(convo)
+            elif intent == "trailers":      _go_trailers(convo)
+            elif intent == "electronics":   _go_electronics(convo)
+            elif intent == "atv_utv":       _go_atv_utv(convo)
+            elif intent == "fishing_gear":  _go_fishing_gear(convo)
+            elif intent == "general_accessories": _go_gen_accessories(convo)
+            else:                           _go_general_inquiry(convo)
+        # Fallback: keyword substring matching for list selections
+        elif "engine" in text_lower:
             _go_engine_sales(convo)
         elif "part" in text_lower:
             _go_parts_sales(convo)
         elif "service" in text_lower or "repair" in text_lower or "maintenance" in text_lower:
             _go_service(convo)
-        else:
-            # Something Else → Menu 2
-            convo["state"] = "awaiting_menu_2"
-            send_whatsapp_list(
-                phone,
-                "No problem! What about these?",
-                "Choose One",
-                ["Boats", "Trailers", "Electronics", "Something Else"]
-            )
-        return
-
-    # ── awaiting_menu_2: Boats / Trailers / Electronics / Something Else ──────
-    elif state == "awaiting_menu_2":
-        if "boat" in text_lower:
+        elif "boat" in text_lower:
             _go_boat_sales(convo)
         elif "trailer" in text_lower:
             _go_trailers(convo)
         elif "electronic" in text_lower or "garmin" in text_lower or "audio" in text_lower:
             _go_electronics(convo)
-        else:
-            convo["state"] = "awaiting_menu_3"
-            send_whatsapp_list(
-                phone,
-                "We've got more! Looking for any of these?",
-                "Choose One",
-                ["ATVs & UTVs", "Fishing Gear", "General Accessories", "Something Else"]
-            )
-        return
-
-    # ── awaiting_menu_3: ATVs / Fishing / Accessories / Something Else ────────
-    elif state == "awaiting_menu_3":
-        if "atv" in text_lower or "utv" in text_lower:
+        elif "atv" in text_lower or "utv" in text_lower:
             _go_atv_utv(convo)
         elif "fish" in text_lower or "lure" in text_lower:
             _go_fishing_gear(convo)
         elif "accessor" in text_lower:
             _go_gen_accessories(convo)
         else:
+            # "Something Else" or unrecognised → general inquiry
             _go_general_inquiry(convo)
         return
 
@@ -1880,7 +2174,7 @@ def process_cold_message(convo: dict, message_text: str):
 
     # SERVICE (Branch C)
     elif state == "branch_service_c1":
-        if "routine" in text_lower or "maintenance" in text_lower:
+        if "routine" in text_lower or "maintenance" in text_lower or "service" in text_lower:
             convo["service_type"] = "routine_maintenance"
             convo["state"] = "branch_service_c2a"
             send_whatsapp_message(
@@ -2125,30 +2419,69 @@ def process_cold_message(convo: dict, message_text: str):
 
     # ── Confirmation Handler ───────────────────────────────────────────────────
     elif state == "awaiting_confirm":
-        if any(w in text_lower for w in ["yes", "send", "✅", "look", "correct",
+        is_interactive_msg = convo.get("_last_is_interactive", False)
+        if any(w in text_lower for w in ["yes", "send", "sent", "✅", "look", "correct",
                                           "confirm", "right", "good", "ok", "okay"]):
             handle_post_confirm(convo)
-        else:
-            # Let them fix
+        elif text_lower in ("let me fix", "✏️ let me fix", "fix", "edit", "change",
+                             "no", "nope", "not right", "wrong"):
+            # Simple rejection / button tap — ask what to change
             convo["state"] = "awaiting_fix"
             send_whatsapp_message(
                 phone,
                 "No problem! What would you like to update? Just type the "
                 "correction and I'll update the inquiry."
             )
+        elif "?" in message_text:
+            # Customer is asking a question, not correcting — re-show confirm buttons
+            logger.info(f"Question detected at awaiting_confirm for {phone}: '{message_text[:80]}'")
+            summary = build_summary(convo)
+            send_whatsapp_buttons(
+                phone,
+                summary + "\n\nReady to send, or would you like to make changes?",
+                ["✅ Yes, Send It", "✏️ Let Me Fix"]
+            )
+        elif is_interactive_msg:
+            # Stale button tap from a previous state — re-show confirm buttons
+            logger.info(f"Stale interactive button at awaiting_confirm for {phone}: '{message_text[:80]}'")
+            summary = build_summary(convo)
+            send_whatsapp_buttons(
+                phone,
+                summary + "\n\nReady to send, or would you like to make changes?",
+                ["✅ Yes, Send It", "✏️ Let Me Fix"]
+            )
+        else:
+            # Customer typed a correction inline (e.g. "No i want a combo unit")
+            # This IS their correction — capture it immediately
+            correction = message_text.strip()
+            _apply_correction(convo, correction)
+            convo["state"] = "awaiting_confirm"
+            summary = build_summary(convo)
+            send_whatsapp_buttons(
+                phone,
+                summary + f"\n\nUpdated: {correction}\n\nDoes this look right now?",
+                ["✅ Yes, Send It", "✏️ Let Me Fix"]
+            )
         return
 
     elif state == "awaiting_fix":
-        # Accept any free-text correction
-        convo["general_inquiry"] = (
-            convo.get("general_inquiry", "") +
-            " [Correction: " + message_text.strip() + "]"
-        )
+        # Ignore stale button taps from old messages
+        if text_lower in ("let me fix", "✏️ let me fix", "fix", "edit", "change",
+                          "yes, send it", "✅ yes, send it"):
+            send_whatsapp_message(
+                phone,
+                "Please type what you'd like to change — for example, "
+                "the product, details, or your name."
+            )
+            return
+        # Accept the actual correction text
+        correction = message_text.strip()
+        _apply_correction(convo, correction)
         convo["state"] = "awaiting_confirm"
         summary = build_summary(convo)
         send_whatsapp_buttons(
             phone,
-            summary + f"\n\nNote added: {message_text.strip()}\n\nDoes this look right now?",
+            summary + f"\n\nUpdated: {correction}\n\nDoes this look right now?",
             ["✅ Yes, Send It", "✏️ Let Me Fix"]
         )
         return
@@ -2233,16 +2566,20 @@ def _proceed_after_fisherman_id(convo: dict):
         _show_menu_1(convo)
 
 
-def _show_menu_1(convo: dict):
-    """Show the main menu (Menu 1)."""
+# Full 10-item category list (single menu, no cascading)
+_MENU_ITEMS = [
+    "Engines", "Parts", "Service", "Boats", "Trailers",
+    "Electronics", "ATVs & UTVs", "Fishing Gear",
+    "General Accessories", "Something Else"
+]
+
+
+def _show_menu_1(convo: dict, greeting: str = ""):
+    """Show the main 10-item menu."""
     name = convo.get("customer_name", "there")
     convo["state"] = "awaiting_menu_1"
-    send_whatsapp_list(
-        convo["phone"],
-        f"Great, thank you {name}! What are you looking for today?",
-        "Choose One",
-        ["Engines", "Parts", "Service", "Something Else"]
-    )
+    msg = greeting or f"Great, thank you {name}! What are you looking for today?"
+    send_whatsapp_list(convo["phone"], msg, "Choose One", _MENU_ITEMS)
 
 
 # ─── Branch Jump Helpers ──────────────────────────────────────────────────────
@@ -2428,21 +2765,25 @@ def process_warm_message(convo: dict, message_text: str):
         return
 
     elif state == "warm_awaiting_fisherman_id":
-        if text_lower in ("yes", "yeah", "yep", "yup", "i have one", "yes, i have one"):
-            convo["state"] = "warm_awaiting_fisherman_id_value"
-            send_whatsapp_message(phone, "Please type your Fisherman ID number:")
-        elif text_lower in ("no", "nah", "nope", "none", "don't have"):
+        # Check for digits first — they might be giving an ID directly
+        if any(c.isdigit() for c in text_lower):
+            convo["fisherman_id"] = message_text.strip()
+            logger.info(f"Warm fisherman ID accepted directly: {convo['fisherman_id']}")
+            _warm_route_by_branch(convo)
+        # Fuzzy "no" matching — any message containing a negative word
+        elif any(neg in text_lower for neg in ("no", "nah", "nope", "none", "don't", "dont", "n/a")):
             convo["fisherman_id"] = ""
             _warm_route_by_branch(convo)
-        elif any(c.isdigit() for c in text_lower):
-            convo["fisherman_id"] = message_text.strip()
-            _warm_route_by_branch(convo)
+        # Yes variants
+        elif text_lower in ("yes", "yeah", "yep", "yup", "ye", "y", "i have one",
+                            "yes i have one", "yes, i have one", "sure", "i do"):
+            convo["state"] = "warm_awaiting_fisherman_id_value"
+            send_whatsapp_message(phone, "Please type your Fisherman ID number:")
         else:
-            send_whatsapp_buttons(
-                phone,
-                "Do you have a Fisherman ID?",
-                ["Yes, I Have One", "No"]
-            )
+            # Accept anything else as the ID (don't loop — v3.7.3 behavior)
+            convo["fisherman_id"] = message_text.strip()
+            logger.info(f"Warm fisherman ID accepted (fallback): {convo['fisherman_id']}")
+            _warm_route_by_branch(convo)
         return
 
     elif state == "warm_awaiting_fisherman_id_value":
@@ -2564,15 +2905,8 @@ def process_hot_message(convo: dict, message_text: str):
             )
         else:
             # Something else
-            name = convo.get("customer_name", "there")
-            convo["state"] = "awaiting_menu_1"
             convo["temperature"] = "cold"
-            send_whatsapp_list(
-                phone,
-                f"Of course, {name}! How can I help you today?",
-                "Choose One",
-                ["Engines", "Parts", "Service", "Something Else"]
-            )
+            _show_menu_1(convo, greeting=f"Of course, {convo.get('customer_name', 'there')}! How can I help you today?")
         return
 
     elif state == "hot_edit":
@@ -2585,14 +2919,8 @@ def process_hot_message(convo: dict, message_text: str):
         elif "service" in text_lower:
             _go_service(convo)
         else:
-            convo["state"] = "awaiting_menu_1"
             convo["temperature"] = "cold"
-            send_whatsapp_list(
-                phone,
-                "What are you looking for?",
-                "Choose One",
-                ["Engines", "Parts", "Service", "Something Else"]
-            )
+            _show_menu_1(convo, greeting="What are you looking for?")
         return
 
     elif state in ("completed", "post_complete", "completed_new_or_done",
@@ -2744,7 +3072,7 @@ def webhook_incoming():
                          customer.get("channel_phone_number", "") or
                          message_obj.get("from", ""))
             phone = normalize_phone(phone_raw)
-            if phone:
+            if phone and phone not in INTERNAL_PHONES:
                 send_whatsapp_message(
                     phone,
                     "Thanks for that! Unfortunately, I can only process text messages "
@@ -2760,6 +3088,11 @@ def webhook_incoming():
                  message_obj.get("from", ""))
     phone = normalize_phone(phone_raw)
 
+    # ── Ignore internal numbers (sales, manager, Claudia herself) ──────────────
+    if phone in INTERNAL_PHONES:
+        logger.info(f"Ignoring message from internal number {phone}")
+        return jsonify({"status": "ok", "note": "internal number ignored"}), 200
+
     if not phone or not raw_message_text:
         logger.warning(
             f"No phone or message text. phone='{phone_raw}', "
@@ -2772,8 +3105,15 @@ def webhook_incoming():
     dedup_keys = []
     if msg_id:
         dedup_keys.append(f"id:{msg_id}")
-    # Content key: phone + first 100 chars of text (catches ID-different duplicates)
-    content_key = f"content:{phone}:{raw_message_text[:100]}"
+    # Content key: phone + message context ID + first 100 chars of text.
+    # Including the context ID (the message being replied to) ensures that
+    # the same button text (e.g. "Yes, Send It") across different inquiries
+    # produces different dedup keys.
+    context_id = ""
+    msg_context = message_obj.get("message_context")
+    if isinstance(msg_context, dict):
+        context_id = msg_context.get("id", "")
+    content_key = f"content:{phone}:{context_id}:{raw_message_text[:100]}"
     dedup_keys.append(content_key)
 
     for key in dedup_keys:
@@ -2808,6 +3148,7 @@ def _process_message(phone: str, message_text: str, is_interactive: bool,
     convo["message_count"] += 1
     convo["all_messages"].append(message_text[:500])
     convo["last_message_at"] = datetime.now(timezone.utc).isoformat()
+    convo["_last_is_interactive"] = is_interactive  # Track for downstream handlers
 
     # Store first message
     if convo["message_count"] == 1:
@@ -2827,6 +3168,40 @@ def _process_message(phone: str, message_text: str, is_interactive: bool,
         f"msg='{message_text[:100]}'"
     )
 
+    # ── Human agent offramp (any state EXCEPT name collection) ─────────────────
+    _agent_keywords = {
+        "agent", "human", "real person", "speak to someone", "talk to someone",
+        "talk to a person", "representative", "manager", "supervisor",
+        "can i call", "how do i contact", "how can i reach",
+        "phone number", "call you", "call me",
+        "i want to talk", "let me speak", "transfer me",
+        "someone else", "actual person",
+    }
+    text_lower = message_text.strip().lower()
+    # Skip offramp during name collection — "call me X" is giving a name, not requesting an agent
+    _skip_offramp_states = {"awaiting_name", "awaiting_name_verify", "awaiting_name_confirm"}
+    if (convo.get("state") not in _skip_offramp_states and
+            (text_lower in _agent_keywords or any(kw in text_lower for kw in _agent_keywords))):
+        logger.info(f"Human agent offramp triggered for {phone}: '{message_text}'")
+        # Forward whatever we have so far as a lead
+        if convo.get("state") != "completed":
+            forward_lead_to_whatsapp(convo)
+            convo["lead_forwarded_at"] = datetime.now(timezone.utc).isoformat()
+        convo["state"] = "completed"
+        convo["confirmed"] = True
+        convo["human_requested"] = True
+        send_whatsapp_message(
+            phone,
+            "OK I will send your inquiry over right now \U0001f4e8\n\n"
+            "But if you want to talk to a human directly right away, "
+            "please call us at:\n\n"
+            "\U0000260e\ufe0f 876-927-8700\n"
+            "\U0000260e\ufe0f 876-619-0986 (Digicel)\n\n"
+            "Tell them Claudia sent you and they will check their logs for more info."
+        )
+        save_conversation(convo)
+        return
+
     # ── Wave Runner check (any state, any temperature) ─────────────────────────
     if check_wave_runner(message_text):
         convo["branch"] = "wave_runner_banned"
@@ -2844,7 +3219,8 @@ def _process_message(phone: str, message_text: str, is_interactive: bool,
         return
 
     # ── First message temperature detection ──────────────────────────────────
-    if convo["message_count"] == 1 and convo["state"] == "init":
+    # Run on first message OR when init was buffered (rapid-fire greetings)
+    if convo["state"] == "init" and not convo.get("_temp_detected"):
         temp, branch, extracted, pattern_name = detect_temperature(message_text)
         convo["temperature"]      = temp
         convo["branch"]           = branch or convo["branch"]
@@ -2870,6 +3246,7 @@ def _process_message(phone: str, message_text: str, is_interactive: bool,
             f"Pattern: {pattern_name} | Intent: {convo.get('pending_intent')} | "
             f"Phone: {phone}"
         )
+        convo["_temp_detected"] = True  # Prevent re-running on buffered flush
 
     # ── Message buffering for free-text states ────────────────────────────────
     current_state = convo["state"]
